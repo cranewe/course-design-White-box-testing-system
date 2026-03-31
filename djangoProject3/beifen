@@ -1,0 +1,177 @@
+@csrf_exempt
+def run_project(request, project_id):
+    """运行指定的源代码项目和测试用例"""
+    try:
+        # 获取请求体中的数据
+        data = json.loads(request.body)
+        test_case_id = data.get('testCaseId')  # 获取测试用例ID
+
+        project = SourceCodeProject.objects.get(id=project_id)
+
+        # 更新项目状态为运行中
+        project.status = 'running'
+        project.save()
+
+        # 在后台线程中执行运行
+        def run_execution():
+            try:
+                # 获取项目路径
+                project_path = project.project_path
+                env_name = get_conda_env_name(project_id)
+
+                # 查找指定的测试用例
+                test_case = GeneratedTestCaseFile.objects.get(id=test_case_id)
+
+                # 检查是否为Java项目
+                is_java_project = any(file.language == 'Java' for file in project.files.all())
+                has_pom = any(file.file_name == 'pom.xml' for file in project.files.all())
+
+                if is_java_project and has_pom:
+                    try:
+                        # 使用Maven编译和运行指定的测试用例
+                        working_dir = project_path
+
+                        # 1. 清理并编译项目
+                        compile_cmd = 'mvn clean compile'
+                        compile_process = subprocess.Popen(
+                            compile_cmd,
+                            shell=True,
+                            cwd=working_dir,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        compile_stdout, compile_stderr = compile_process.communicate(timeout=60)
+
+                        if compile_process.returncode != 0:
+                            project.status = 'failed'
+                            project.execution_result = {
+                                'error': 'Maven编译失败',
+                                'compile_stdout': compile_stdout,
+                                'compile_stderr': compile_stderr
+                            }
+                            project.save()
+                            return
+
+                        # 2. 运行指定的测试用例
+                        run_cmd = f'mvn -Dtest={test_case.file_name} test'
+                        run_process = subprocess.Popen(
+                            run_cmd,
+                            shell=True,
+                            cwd=working_dir,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+
+                        # 设置超时时间（秒）
+                        timeout = 60  # 测试可能需要更长时间
+                        try:
+                            stdout, stderr = run_process.communicate(timeout=timeout)
+
+                            # 更新项目状态和运行结果
+                            project.status = 'completed'
+                            project.execution_result = {
+                                'compile_stdout': compile_stdout,
+                                'compile_stderr': compile_stderr,
+                                'test_stdout': stdout,
+                                'test_stderr': stderr,
+                                'return_code': run_process.returncode,
+                                'test_case': test_case.file_name
+                            }
+                            project.save()
+
+                        except subprocess.TimeoutExpired:
+                            run_process.kill()
+                            project.status = 'timeout'
+                            project.execution_result = {
+                                'error': f'测试执行超时（{timeout}秒）',
+                                'compile_stdout': compile_stdout,
+                                'compile_stderr': compile_stderr,
+                                'test_case': test_case.file_name
+                            }
+                            project.save()
+
+                    except Exception as e:
+                        project.status = 'failed'
+                        project.execution_result = {
+                            'error': f'Maven执行错误: {str(e)}'
+                        }
+                        project.save()
+
+                # 处理Python项目
+                else:
+                    try:
+                        # 运行指定的测试用例
+                        test_case_file = test_case.file_path  # 获取测试用例文件路径
+                        working_dir = os.path.dirname(test_case_file)  # 获取测试文件所在目录
+
+                        # 使用pytest运行测试
+                        cmd = f'pytest {test_case_file} -v'
+                        
+                        process = subprocess.Popen(
+                            cmd,
+                            shell=True,
+                            cwd=working_dir,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+
+                        try:
+                            stdout, stderr = process.communicate(timeout=30)
+
+                            # 解析pytest输出
+                            test_results = []
+                            for line in stdout.split('\n'):
+                                if 'PASSED' in line or 'FAILED' in line:
+                                    test_results.append(line.strip())
+
+                            # 更新项目状态和运行结果
+                            project.status = 'completed'
+                            project.execution_result = {
+                                'stdout': stdout,
+                                'stderr': stderr,
+                                'return_code': process.returncode,
+                                'test_results': test_results,
+                                'test_case': test_case.file_name
+                            }
+                            project.save()
+
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            project.status = 'timeout'
+                            project.execution_result = {
+                                'error': '测试执行超时（30秒）'
+                            }
+                            project.save()
+
+                    except Exception as e:
+                        project.status = 'failed'
+                        project.execution_result = {
+                            'error': str(e)
+                        }
+                        project.save()
+
+            except Exception as e:
+                project.status = 'failed'
+                project.execution_result = {
+                    'error': str(e)
+                }
+                project.save()
+
+        # 启动后台执行线程
+        execution_thread = threading.Thread(target=run_execution)
+        execution_thread.start()
+
+        return JsonResponse({
+            'message': '项目运行已启动',
+            'project_id': project.id,
+            'test_case_id': test_case_id  # 返回测试用例ID
+        })
+
+    except SourceCodeProject.DoesNotExist:
+        return JsonResponse({'error': '项目不存在'}, status=404)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
